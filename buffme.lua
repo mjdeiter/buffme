@@ -1,34 +1,32 @@
 -- ======================================================================
--- BuffMe v1.0.0 (Refactored)
+-- BuffMe v1.0.2 (Fixed)
 -- Project Lazarus - Tell-triggered group buff dispatcher (Controller GUI)
 --
--- Improvements over v0.9.0:
---   - Explicit FSM for cache building
---   - ImGui availability detection
---   - Enhanced error recovery
---   - Headless mode support
---   - Better diagnostic logging
+-- Fixes in v1.0.2:
+--   - Fixed settings corruption causing checkbox issues
+--   - Improved spell filtering to exclude EMU placeholders
+--   - Better type validation on settings save/load
+--   - Fixed "True*" spell spam in cache
+--   - Added settings validation and repair on load
+--
+-- Fixes in v1.0.1:
+--   - Fixed "True Name" spam in spell cache
+--   - Fixed checkboxes not working
+--   - Fixed settings not persisting
+--   - Better spell name validation
+--   - More robust settings loading
 --
 -- Usage:
 --   /lua run buffme.lua        (run on your driver/controller)
 --   Anyone can /tell you: buff me
 --   Your group will attempt to cast your configured buff list on them.
---
--- Broadcast Auto-Detect:
---   - Prefers E3Next: /e3bcga
---   - Falls back to EQBC: /bcga   (requires eqbc plugin)
---
--- Files:
---   buffme_settings.lua   (persistent config + buff list)
---   buffme_spellcache.lua (persistent spell name cache for lookup)
---   buffme_agent.lua      (run on group members on demand)
 -- ======================================================================
 
 local mq = require('mq')
 local ImGui = require('ImGui')
 
 local SCRIPT_NAME = 'BuffMe'
-local SCRIPT_VER  = '1.0.0'
+local SCRIPT_VER  = '1.0.2'
 
 -- -----------------------------
 -- FSM States
@@ -67,11 +65,9 @@ local SPELLCACHE_FILE = joinPath(CONFIG_DIR, 'buffme_spellcache.lua')
 local function trimString(s)
   if not s then return '' end
   local str = tostring(s)
-  -- Remove leading whitespace
   while str:match('^%s') do
     str = str:sub(2)
   end
-  -- Remove trailing whitespace
   while str:match('%s$') do
     str = str:sub(1, -2)
   end
@@ -92,8 +88,11 @@ local function escStr(s)
 end
 
 local function writeLuaReturnTable(path, t)
-  local f = io.open(path, 'w+')
-  if not f then return false end
+  local f, err = io.open(path, 'w+')
+  if not f then 
+    print(string.format('[%s] ERROR: Could not write to %s: %s', SCRIPT_NAME, path, tostring(err)))
+    return false 
+  end
 
   local function ser(v, indent)
     indent = indent or 0
@@ -148,9 +147,9 @@ local function loadLuaTable(path)
 end
 
 -- -----------------------------
--- Settings
+-- Settings with type validation
 -- -----------------------------
-local settings = {
+local DEFAULT_SETTINGS = {
   enabled = true,
   triggerText = 'buff me',
   allowBackgroundCacheBuild = false,
@@ -160,29 +159,109 @@ local settings = {
   showDebug = false,
 }
 
+local settings = {}
+
+-- Deep copy defaults
+for k, v in pairs(DEFAULT_SETTINGS) do
+  if type(v) == 'table' then
+    settings[k] = {}
+  else
+    settings[k] = v
+  end
+end
+
+local function validateAndRepairSettings(t)
+  if type(t) ~= 'table' then return false end
+  
+  local repaired = false
+  
+  -- Validate each setting with type checking
+  if type(t.enabled) ~= 'boolean' then
+    print(string.format('[%s] Repairing corrupted setting: enabled (was %s)', SCRIPT_NAME, type(t.enabled)))
+    t.enabled = DEFAULT_SETTINGS.enabled
+    repaired = true
+  end
+  
+  if type(t.triggerText) ~= 'string' or t.triggerText == '' then
+    print(string.format('[%s] Repairing corrupted setting: triggerText (was %s)', SCRIPT_NAME, type(t.triggerText)))
+    t.triggerText = DEFAULT_SETTINGS.triggerText
+    repaired = true
+  end
+  
+  if type(t.allowBackgroundCacheBuild) ~= 'boolean' then
+    print(string.format('[%s] Repairing corrupted setting: allowBackgroundCacheBuild', SCRIPT_NAME))
+    t.allowBackgroundCacheBuild = DEFAULT_SETTINGS.allowBackgroundCacheBuild
+    repaired = true
+  end
+  
+  if type(t.cooldownSecondsPerPlayer) ~= 'number' then
+    print(string.format('[%s] Repairing corrupted setting: cooldownSecondsPerPlayer', SCRIPT_NAME))
+    t.cooldownSecondsPerPlayer = DEFAULT_SETTINGS.cooldownSecondsPerPlayer
+    repaired = true
+  end
+  
+  if type(t.queueProcessDelayMs) ~= 'number' then
+    print(string.format('[%s] Repairing corrupted setting: queueProcessDelayMs', SCRIPT_NAME))
+    t.queueProcessDelayMs = DEFAULT_SETTINGS.queueProcessDelayMs
+    repaired = true
+  end
+  
+  if type(t.buffList) ~= 'table' then
+    print(string.format('[%s] Repairing corrupted setting: buffList', SCRIPT_NAME))
+    t.buffList = {}
+    repaired = true
+  end
+  
+  if type(t.showDebug) ~= 'boolean' then
+    print(string.format('[%s] Repairing corrupted setting: showDebug', SCRIPT_NAME))
+    t.showDebug = DEFAULT_SETTINGS.showDebug
+    repaired = true
+  end
+  
+  return repaired
+end
+
 local function loadSettings()
   local t = loadLuaTable(SETTINGS_FILE)
+  local needsSave = false
+  
   if type(t) == 'table' then
-    for k,v in pairs(settings) do
-      if t[k] ~= nil then settings[k] = t[k] end
+    -- Validate and repair if needed
+    if validateAndRepairSettings(t) then
+      needsSave = true
     end
+    
+    -- Load validated settings
+    settings.enabled = t.enabled
+    settings.triggerText = t.triggerText
+    settings.allowBackgroundCacheBuild = t.allowBackgroundCacheBuild
+    settings.cooldownSecondsPerPlayer = t.cooldownSecondsPerPlayer
+    settings.queueProcessDelayMs = t.queueProcessDelayMs
+    settings.buffList = t.buffList
+    settings.showDebug = t.showDebug
+  else
+    print(string.format('[%s] No valid settings found, using defaults', SCRIPT_NAME))
+    needsSave = true
   end
-  if type(settings.buffList) ~= 'table' then 
-    settings.buffList = {} 
-  end
-  if type(settings.triggerText) ~= 'string' or settings.triggerText == '' then 
-    settings.triggerText = 'buff me' 
-  end
-  if type(settings.cooldownSecondsPerPlayer) ~= 'number' then 
-    settings.cooldownSecondsPerPlayer = 60 
-  end
-  if type(settings.queueProcessDelayMs) ~= 'number' then
-    settings.queueProcessDelayMs = 500
+  
+  -- Save if we repaired anything
+  if needsSave then
+    print(string.format('[%s] Saving repaired settings...', SCRIPT_NAME))
+    saveSettings()
   end
 end
 
 local function saveSettings()
-  writeLuaReturnTable(SETTINGS_FILE, settings)
+  -- Validate before saving
+  validateAndRepairSettings(settings)
+  
+  local success = writeLuaReturnTable(SETTINGS_FILE, settings)
+  if success then
+    print(string.format('[%s] Settings saved successfully', SCRIPT_NAME))
+  else
+    print(string.format('[%s] WARNING: Failed to save settings', SCRIPT_NAME))
+  end
+  return success
 end
 
 -- -----------------------------
@@ -191,7 +270,7 @@ end
 local MAX_SPELL_ID = 60000
 local CACHE_STEP_PER_TICK = 250
 local CACHE_AUTOSAVE_EVERY = 2000
-local CACHE_SCHEMA_VERSION = 1
+local CACHE_SCHEMA_VERSION = 2  -- Bumped for new filtering
 
 local spellCache = {
   schema = CACHE_SCHEMA_VERSION,
@@ -264,6 +343,8 @@ local function loadSpellCache()
   end
   if not t.schema then t.schema = 1 end
   if tonumber(t.schema) ~= CACHE_SCHEMA_VERSION then
+    print(string.format('[%s] Cache schema mismatch (have %s, need %d) - will rebuild', 
+      SCRIPT_NAME, tostring(t.schema), CACHE_SCHEMA_VERSION))
     transitionCacheState(CacheState.IDLE)
     rebuildCacheIndex()
     return false
@@ -275,7 +356,6 @@ local function loadSpellCache()
   spellCache.scanned_to = t.scanned_to or 0
   spellCache.spells = t.spells
   
-  -- Determine state from loaded data
   if t.scanned_to and t.scanned_to >= (t.max_spell_id or MAX_SPELL_ID) then
     transitionCacheState(CacheState.COMPLETE)
   else
@@ -297,13 +377,83 @@ local function saveSpellCache()
   return writeLuaReturnTable(SPELLCACHE_FILE, t)
 end
 
+-- IMPROVED: Much better spell name validation for EMU
+local INVALID_SPELL_NAMES = {
+  ['null'] = true,
+  ['unknown'] = true,
+  ['unknown spell'] = true,
+  ['true name'] = true,
+  ['truename'] = true,
+  ['truesight'] = true,
+  ['true sight'] = true,
+  ['true spirit'] = true,
+  ['truespirit'] = true,
+  ['true north'] = true,
+  ['truenorth'] = true,
+  ['test'] = true,
+  ['test spell'] = true,
+  [''] = true,
+}
+
+local INVALID_SPELL_PREFIXES = {
+  'true ',
+  'test ',
+  'debug ',
+  'gm ',
+  'xxx',
+  '***',
+  '!!!',
+}
+
+local function isValidSpellName(name)
+  if not name or name == '' then return false end
+  
+  local lower = name:lower()
+  
+  -- Check exact matches
+  if INVALID_SPELL_NAMES[lower] then 
+    return false 
+  end
+  
+  -- Check prefixes
+  for _, prefix in ipairs(INVALID_SPELL_PREFIXES) do
+    if lower:sub(1, #prefix) == prefix then
+      return false
+    end
+  end
+  
+  -- Filter out names that are just numbers
+  if lower:match('^%d+$') then 
+    return false 
+  end
+  
+  -- Filter out very short names (likely invalid)
+  if #name < 3 then 
+    return false 
+  end
+  
+  -- Filter out names with weird characters that indicate placeholder data
+  if name:match('[_%[%]{}#@$%%^&*]') then
+    return false
+  end
+  
+  -- Filter out names that are mostly numbers (like "Spell 1234")
+  local numCount = 0
+  for _ in name:gmatch('%d') do
+    numCount = numCount + 1
+  end
+  if numCount / #name > 0.5 then
+    return false
+  end
+  
+  return true
+end
+
 local function getSpellName(spellId)
   local sp = mq.TLO.Spell(spellId)
   if not sp or not sp() then return nil end
   local nm = sp.Name and sp.Name() or nil
-  if not nm or nm == '' then return nil end
-  local l = nm:lower()
-  if l == 'null' or l == 'unknown' or l == 'unknown spell' then return nil end
+  if not isValidSpellName(nm) then return nil end
   return nm
 end
 
@@ -642,6 +792,7 @@ local function drawCacheStats()
   ImGui.Text(string.format('File Size: %d bytes', getFileSize(SPELLCACHE_FILE)))
   ImGui.Separator()
   ImGui.Text(string.format('State: %s', spellCache.state))
+  ImGui.Text(string.format('Schema: %d', spellCache.schema))
   if spellCache.error_message then
     ImGui.TextColored(1, 0, 0, 1, string.format('Error: %s', spellCache.error_message))
   end
@@ -650,6 +801,8 @@ local function drawCacheStats()
   ImGui.Text(string.format('Progress: %d / %d', spellCache.scanned_to or 0, spellCache.max_spell_id or 0))
   ImGui.ProgressBar(pct or 0, -1, 0, string.format('%d%%', math.floor((pct or 0)*100)))
   
+  ImGui.Separator()
+  ImGui.TextColored(1, 0.5, 0, 1, 'Warning: This will delete and rebuild the entire cache')
   if ImGui.Button('Force Reset Cache') then
     spellCache.spells = {}
     spellCache.scanned_to = 0
@@ -657,6 +810,7 @@ local function drawCacheStats()
     transitionCacheState(CacheState.IDLE)
     rebuildCacheIndex()
     saveSpellCache()
+    print(string.format('[%s] Cache reset - will rebuild on next lookup', SCRIPT_NAME))
   end
 end
 
@@ -714,21 +868,33 @@ local function drawUI()
     ImGui.Text(string.format('Mode: %s | Trigger: "%s" | Enabled: %s', mode, settings.triggerText, tostring(settings.enabled)))
     ImGui.Separator()
 
-    local changed
-    changed, settings.enabled = ImGui.Checkbox('Enable Tell Trigger', settings.enabled)
-    if changed then saveSettings() end
+    -- Checkbox handling with immediate save
+    local enabledChanged, newEnabled = ImGui.Checkbox('Enable Tell Trigger', settings.enabled)
+    if enabledChanged then
+      settings.enabled = newEnabled
+      print(string.format('[%s] Tell trigger %s', SCRIPT_NAME, newEnabled and 'ENABLED' or 'DISABLED'))
+      saveSettings()
+    end
+    tooltip('When enabled, listens for tells matching your trigger text')
+    
     ImGui.SameLine()
-    changed, settings.allowBackgroundCacheBuild = ImGui.Checkbox('Allow background cache build', settings.allowBackgroundCacheBuild)
-    if changed then saveSettings() end
+    
+    local cacheChanged, newCache = ImGui.Checkbox('Allow background cache build', settings.allowBackgroundCacheBuild)
+    if cacheChanged then
+      settings.allowBackgroundCacheBuild = newCache
+      print(string.format('[%s] Background cache build %s', SCRIPT_NAME, newCache and 'ENABLED' or 'DISABLED'))
+      saveSettings()
+    end
+    tooltip('Allow spell cache to build even when this window is closed')
 
     ImGui.Separator()
 
     ImGui.TextUnformatted('Tell trigger text (case-insensitive exact match):')
     local trig = settings.triggerText or 'buff me'
-    local te
-    te, trig = ImGui.InputText('##trigger', trig, 64)
-    if te then
-      settings.triggerText = trig
+    local trigChanged, newTrig = ImGui.InputText('##trigger', trig, 64)
+    if trigChanged and newTrig ~= '' then
+      settings.triggerText = newTrig
+      print(string.format('[%s] Trigger text changed to: "%s"', SCRIPT_NAME, newTrig))
       saveSettings()
     end
     tooltip('Example: players send you /tell <driver> "buff me"')
@@ -737,10 +903,9 @@ local function drawUI()
 
     if ImGui.CollapsingHeader('Spell Lookup (Add to Buff List)', ImGuiTreeNodeFlags.DefaultOpen) then
       local q = lookup.query or ''
-      local qe
-      qe, q = ImGui.InputTextWithHint('##lookup', 'Type spell name...', q, 128)
-      if qe then
-        lookup.query = q
+      local qChanged, newQ = ImGui.InputTextWithHint('##lookup', 'Type spell name...', q, 128)
+      if qChanged then
+        lookup.query = newQ
         lookup.dirty = true
       end
 
@@ -755,12 +920,13 @@ local function drawUI()
       if ImGui.Button('Build/Resume Cache') then
         ensureCacheBuilding()
       end
+      tooltip('Start or resume building the spell cache')
 
       local cacheCount = (type(spellCache.spells)=='table') and #spellCache.spells or 0
       if spellCache.state == CacheState.COMPLETE then
-        ImGui.Text(string.format('Cache: complete (%d spells)', cacheCount))
+        ImGui.TextColored(0, 1, 0, 1, string.format('Cache: complete (%d spells)', cacheCount))
       elseif spellCache.state == CacheState.BUILDING then
-        ImGui.Text(string.format('Cache: building (%d spells, scanned %d/%d)', cacheCount, spellCache.scanned_to, spellCache.max_spell_id))
+        ImGui.TextColored(1, 1, 0, 1, string.format('Cache: building (%d spells, scanned %d/%d)', cacheCount, spellCache.scanned_to, spellCache.max_spell_id))
       elseif spellCache.state == CacheState.ERROR then
         ImGui.TextColored(1, 0, 0, 1, string.format('Cache: ERROR (%d spells)', cacheCount))
       else
@@ -777,7 +943,7 @@ local function drawUI()
         ImGui.TextUnformatted('(Type to search)')
       else
         if #lookup.results == 0 then
-          ImGui.TextUnformatted('(No matches)')
+          ImGui.TextUnformatted('(No matches - cache may need building)')
         else
           for _,idx in ipairs(lookup.results) do
             local rec = spellCache.spells[idx]
@@ -799,10 +965,11 @@ local function drawUI()
           ImGui.Text(string.format('Selected: %s', rec.name))
           local canAdd = not buffListHas(rec.name)
           if not canAdd then
-            ImGui.TextUnformatted('(Already in buff list)')
+            ImGui.TextColored(1, 0.5, 0, 1, '(Already in buff list)')
           end
           if ImGui.Button('Add Selected Spell') and canAdd then
             addBuffSpell(rec.name)
+            print(string.format('[%s] Added spell to buff list: %s', SCRIPT_NAME, rec.name))
           end
         end
       end
@@ -812,16 +979,15 @@ local function drawUI()
 
     if ImGui.CollapsingHeader('Buff List (What gets cast)', ImGuiTreeNodeFlags.DefaultOpen) then
       if #settings.buffList == 0 then
-        ImGui.TextUnformatted('(No buffs configured yet. Use Spell Lookup above to add spells.)')
+        ImGui.TextColored(0.7, 0.7, 0.7, 1, '(No buffs configured yet. Use Spell Lookup above to add spells.)')
       end
 
       for i,rec in ipairs(settings.buffList) do
         ImGui.PushID(i)
         local en = rec.enabled == true
-        local ce
-        ce, en = ImGui.Checkbox('##enabled', en)
-        if ce then
-          rec.enabled = en
+        local enabledChanged, newEn = ImGui.Checkbox('##enabled', en)
+        if enabledChanged then
+          rec.enabled = newEn
           saveSettings()
         end
         ImGui.SameLine()
@@ -832,7 +998,10 @@ local function drawUI()
         ImGui.SameLine()
         if ImGui.Button('Dn') then moveBuff(i, 1) end
         ImGui.SameLine()
-        if ImGui.Button('Remove') then removeBuffIndex(i) end
+        if ImGui.Button('Remove') then 
+          print(string.format('[%s] Removed spell from buff list: %s', SCRIPT_NAME, rec.name))
+          removeBuffIndex(i) 
+        end
 
         ImGui.PopID()
       end
@@ -842,7 +1011,7 @@ local function drawUI()
 
     if ImGui.CollapsingHeader('Manual Test / Queue', ImGuiTreeNodeFlags.DefaultOpen) then
       ImGui.TextUnformatted('Last Status:')
-      ImGui.TextUnformatted(state.lastStatus or '')
+      ImGui.TextColored(0.8, 0.8, 0.8, 1, state.lastStatus or '(none)')
 
       ImGui.Separator()
       ImGui.Text(string.format('Queue: %d pending', #state.queue))
@@ -858,9 +1027,8 @@ local function drawUI()
       ImGui.Separator()
       ImGui.TextUnformatted('Test by name:')
       local testName = state.testName or ''
-      local ed
-      ed, testName = ImGui.InputText('##testname', testName, 64)
-      if ed then state.testName = testName end
+      local testChanged, newTest = ImGui.InputText('##testname', testName, 64)
+      if testChanged then state.testName = newTest end
       ImGui.SameLine()
       if ImGui.Button('Enqueue Test') then
         if testName and testName ~= '' then
@@ -872,9 +1040,11 @@ local function drawUI()
 
     ImGui.Separator()
 
-    local dbgChanged
-    dbgChanged, settings.showDebug = ImGui.Checkbox('Show debug panels', settings.showDebug)
-    if dbgChanged then saveSettings() end
+    local dbgChanged, newDebug = ImGui.Checkbox('Show debug panels', settings.showDebug)
+    if dbgChanged then
+      settings.showDebug = newDebug
+      saveSettings()
+    end
     if settings.showDebug then
       drawCacheStats()
     end
@@ -897,6 +1067,8 @@ local function init()
   print(string.format('[%s] v%s initializing...', SCRIPT_NAME, SCRIPT_VER))
   
   loadSettings()
+  print(string.format('[%s] Settings loaded: enabled=%s, trigger="%s"', SCRIPT_NAME, tostring(settings.enabled), settings.triggerText))
+  
   loadSpellCache()
   
   ui.available = checkImGuiAvailable()
