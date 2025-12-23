@@ -1,8 +1,15 @@
 -- ======================================================================
--- buffme_agent.lua v1.0.0 (Refactored)
+-- buffme_agent.lua v1.0.2 (Updated)
 -- Project Lazarus - BuffMe agent (runs briefly on each group member)
 --
--- Improvements over v0.9.0:
+-- v1.0.2 Updates:
+--   - Version sync with controller
+--   - Consistent utility functions
+--   - Enhanced logging
+--   - Better error reporting
+--
+-- v1.0.1 Improvements:
+--   - Fixed string trimming to avoid gsub pattern issues
 --   - Safer TLO access with pessimistic defaults
 --   - Enhanced error handling and logging
 --   - Explicit timeout handling
@@ -19,12 +26,13 @@
 local mq = require('mq')
 
 local SCRIPT_NAME = 'BuffMeAgent'
-local SCRIPT_VER = '1.0.0'
+local SCRIPT_VER = '1.0.2'
 
 -- Configurable timeouts
 local CASTING_TIMEOUT_MS = 8000
 local TARGET_TIMEOUT_MS = 200
 local SPELL_READY_CHECK_TIMEOUT_MS = 100
+local POST_CAST_DELAY_MS = 250
 
 -- -----------------------------
 -- Utility Functions
@@ -38,12 +46,22 @@ end
 
 local function joinPath(a, b)
   if not a or a == '' then return b end
-  if a:sub(-1) == '/' or a:sub(-1) == '\\' then return a .. b end
+  local lastChar = a:sub(-1)
+  if lastChar == '/' or lastChar == '\\' then return a .. b end
   return a .. '/' .. b
 end
 
-local function trim(s)
-  return (tostring(s or ''):gsub('^%s+',''):gsub('%s+$',''))
+-- Consistent with controller trim function
+local function trimString(s)
+  if not s then return '' end
+  local str = tostring(s)
+  while str:match('^%s') do
+    str = str:sub(2)
+  end
+  while str:match('%s$') do
+    str = str:sub(1, -2)
+  end
+  return str
 end
 
 local function logInfo(msg)
@@ -52,6 +70,10 @@ end
 
 local function logError(msg)
   print(string.format('[%s] ERROR: %s', SCRIPT_NAME, msg))
+end
+
+local function logWarning(msg)
+  print(string.format('[%s] WARNING: %s', SCRIPT_NAME, msg))
 end
 
 -- -----------------------------
@@ -68,11 +90,13 @@ end
 -- -----------------------------
 -- Parse Arguments
 -- -----------------------------
-local targetName = trim((arg and arg[1]) or '')
+local targetName = trimString((arg and arg[1]) or '')
 if targetName == '' then
   logError('No target name provided. Usage: /lua run buffme_agent <TargetName>')
   return
 end
+
+logInfo(string.format('v%s starting for target: %s', SCRIPT_VER, targetName))
 
 -- -----------------------------
 -- Load Settings
@@ -80,14 +104,37 @@ end
 local settings = loadLuaTable(SETTINGS_FILE)
 if not settings then
   logError('Could not load settings from: ' .. SETTINGS_FILE)
+  logError('Make sure buffme.lua controller has been run at least once.')
+  return
+end
+
+-- Validate settings
+if type(settings.buffList) ~= 'table' then
+  logError('Invalid settings: buffList is not a table')
   return
 end
 
 local buffList = settings.buffList
-if type(buffList) ~= 'table' or #buffList == 0 then
+if #buffList == 0 then
   logInfo('No buff list configured. Nothing to cast.')
+  logInfo('Add spells via the controller GUI first.')
   return
 end
+
+-- Count enabled buffs
+local enabledCount = 0
+for _, rec in ipairs(buffList) do
+  if type(rec) == 'table' and rec.enabled == true and type(rec.name) == 'string' and rec.name ~= '' then
+    enabledCount = enabledCount + 1
+  end
+end
+
+if enabledCount == 0 then
+  logInfo('No enabled buffs in list. Nothing to cast.')
+  return
+end
+
+logInfo(string.format('Loaded %d total buffs (%d enabled)', #buffList, enabledCount))
 
 -- -----------------------------
 -- Casting State Checks (EMU-Safe)
@@ -138,7 +185,7 @@ local function safeMeCanCast(name)
   
   if type(mana) == 'number' and type(myMana) == 'number' then
     if myMana < mana then
-      logInfo(string.format('Insufficient mana for %s (%d/%d)', name, myMana, mana))
+      logInfo(string.format('Insufficient mana for %s (need %d, have %d)', name, mana, myMana))
       return false
     end
   end
@@ -197,54 +244,56 @@ local function attemptBuff(spellName, targetName)
   if not verifyTarget(targetName) then
     if not targetPlayer(targetName) then
       logError(string.format('Lost target: %s', targetName))
-      return false
+      return false, 'lost_target'
     end
   end
   
   -- Check spell readiness
   if not safeSpellReady(spellName) then
     logInfo(string.format('Spell not ready: %s', spellName))
-    return false
+    return false, 'not_ready'
   end
   
   -- Check if we can cast (mana, book, etc)
   if not safeMeCanCast(spellName) then
-    return false
+    return false, 'cannot_cast'
   end
   
   -- Wait for any existing cast to finish
   if not waitNotCasting(CASTING_TIMEOUT_MS) then
     logError(string.format('Still casting when trying to cast %s', spellName))
-    return false
+    return false, 'still_casting'
   end
   
   -- Attempt the cast
   logInfo(string.format('Casting: %s', spellName))
   if not castSpellOnTarget(spellName) then
-    return false
+    return false, 'cast_failed'
   end
   
   -- Wait for cast to complete
   if not waitNotCasting(CASTING_TIMEOUT_MS) then
     logError(string.format('Cast timeout for %s', spellName))
-    return false
+    return false, 'cast_timeout'
   end
   
   -- Brief delay after cast completes
-  mq.delay(250)
+  mq.delay(POST_CAST_DELAY_MS)
   
-  return true
+  return true, 'success'
 end
 
 -- -----------------------------
 -- Main Execution
 -- -----------------------------
+logInfo('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━')
 logInfo(string.format('Starting buff sequence for: %s', targetName))
-logInfo(string.format('Buff list contains %d entries', #buffList))
+logInfo(string.format('Buff list contains %d entries (%d enabled)', #buffList, enabledCount))
 
 -- Initial target acquisition
 if not targetPlayer(targetName) then
   logError(string.format('Could not target %s. Aborting.', targetName))
+  logError('Make sure the target is in the same zone and /targetable')
   return
 end
 
@@ -255,33 +304,67 @@ mq.delay(100)
 local successCount = 0
 local skipCount = 0
 local failCount = 0
+local results = {
+  success = {},
+  skipped = {},
+  failed = {}
+}
 
 for i, rec in ipairs(buffList) do
   if type(rec) == 'table' and rec.enabled == true then
-    local name = trim(rec.name)
+    local name = trimString(rec.name)
     if name ~= '' then
       logInfo(string.format('[%d/%d] Processing: %s', i, #buffList, name))
       
-      local success = attemptBuff(name, targetName)
+      local success, reason = attemptBuff(name, targetName)
       if success then
         successCount = successCount + 1
         logInfo(string.format('✓ Successfully cast: %s', name))
+        table.insert(results.success, name)
       else
-        -- Check if it was skipped (not ready/mana) vs failed (error)
-        if safeSpellReady(name) or safeMeCanCast(name) then
-          failCount = failCount + 1
-          logError(string.format('✗ Failed to cast: %s', name))
-        else
+        -- Categorize the failure
+        if reason == 'not_ready' or reason == 'cannot_cast' then
           skipCount = skipCount + 1
-          logInfo(string.format('⊘ Skipped: %s', name))
+          logInfo(string.format('⊘ Skipped: %s (%s)', name, reason))
+          table.insert(results.skipped, {name = name, reason = reason})
+        else
+          failCount = failCount + 1
+          logError(string.format('✗ Failed to cast: %s (%s)', name, reason))
+          table.insert(results.failed, {name = name, reason = reason})
         end
       end
+      
+      -- Brief pause between attempts
+      mq.delay(100)
     end
   end
 end
 
 -- Summary
-logInfo('─────────────────────────────')
+logInfo('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━')
 logInfo(string.format('Buff sequence complete for: %s', targetName))
-logInfo(string.format('Success: %d | Skipped: %d | Failed: %d', successCount, skipCount, failCount))
-logInfo('─────────────────────────────')
+logInfo(string.format('Results: %d success | %d skipped | %d failed', successCount, skipCount, failCount))
+
+if successCount > 0 then
+  logInfo(string.format('Successfully cast %d buffs:', successCount))
+  for _, name in ipairs(results.success) do
+    logInfo(string.format('  ✓ %s', name))
+  end
+end
+
+if skipCount > 0 then
+  logInfo(string.format('Skipped %d buffs (not ready/no mana):', skipCount))
+  for _, entry in ipairs(results.skipped) do
+    logInfo(string.format('  ⊘ %s (%s)', entry.name, entry.reason))
+  end
+end
+
+if failCount > 0 then
+  logError(string.format('Failed to cast %d buffs:', failCount))
+  for _, entry in ipairs(results.failed) do
+    logError(string.format('  ✗ %s (%s)', entry.name, entry.reason))
+  end
+end
+
+logInfo('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━')
+logInfo('Agent complete. Exiting.')
