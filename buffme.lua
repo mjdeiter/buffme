@@ -1,6 +1,11 @@
 -- ======================================================================
--- BuffMe v1.0.10 (ImGui InputText Fix - SEARCH NOW WORKS!)
+-- BuffMe v1.0.12
 -- Project Lazarus - Tell-triggered group buff dispatcher (Controller GUI)
+--
+-- -- Fixes in v1.0.12:
+--   - Spell lookup now deduplicates by name and auto-selects the highest-rank (highest min level) version
+--   - Selected spell shows spell description/details panel (SpellExport-style)
+--   - Manual Test retains Local Test fallback when no broadcast plugin is loaded
 --
 -- Fixes in v1.0.10:
 --   - CRITICAL: Fixed ImGui.InputText() to use Lazarus-compatible pattern
@@ -31,7 +36,7 @@ local mq = require('mq')
 local ImGui = require('ImGui')
 
 local SCRIPT_NAME = 'BuffMe'
-local SCRIPT_VER  = '1.0.10'
+local SCRIPT_VER  = '1.0.11'
 
 -- -----------------------------
 -- FSM States
@@ -459,6 +464,37 @@ local lookup = {
   selected = nil
 }
 
+
+-- Selected spell details cache (for description panel)
+local selectedDetailsID = nil
+local selectedDetails = nil
+
+local function vcall(x)
+  if type(x) == 'function' then return x() end
+  return x
+end
+
+local function buildSpellDetails(id)
+  local sp = safe(function() return mq.TLO.Spell(id) end)
+  if not sp or not sp.ID or vcall(sp.ID) == 0 then return nil end
+
+  local details = {
+    id = id,
+    name = safe(function() return vcall(sp.Name) end) or ('#' .. tostring(id)),
+    desc = safe(function() return vcall(sp.Description) end) or safe(function() return vcall(sp.Desc) end) or '',
+    mana = safe(function() return vcall(sp.Mana) end),
+    castTime = safe(function() return vcall(sp.CastTime) end),
+    recastTime = safe(function() return vcall(sp.RecastTime) end),
+    duration = safe(function() return vcall(sp.Duration) end),
+    range = safe(function() return vcall(sp.Range) end),
+    targetType = safe(function() return vcall(sp.TargetType) end),
+    spellType = safe(function() return vcall(sp.SpellType) end),
+  }
+
+
+  return details
+end
+
 local function getSpellSuggestions(prefix)
   prefix = trimString(prefix)
   
@@ -486,10 +522,29 @@ local function getSpellSuggestions(prefix)
   local search = prefix:lower()
   local matches = {}
 
-  -- SpellExport's proven fuzzy matching algorithm
+  -- Deduplicate by spell name and pick the "highest rank" automatically.
+  -- Heuristic: choose the entry with the highest minLevel; tie-break by higher spell ID.
+  local bestByName = {}
   for _, entry in ipairs(spellCache) do
+    local k = entry.nameLower
+    if k and k ~= '' then
+      local cur = bestByName[k]
+      if not cur then
+        bestByName[k] = entry
+      else
+        local a = cur.minLevel or -1
+        local b = entry.minLevel or -1
+        if (b > a) or (b == a and (entry.id or 0) > (cur.id or 0)) then
+          bestByName[k] = entry
+        end
+      end
+    end
+  end
+
+  -- SpellExport's proven fuzzy matching algorithm (applied to deduped list)
+  for _, entry in pairs(bestByName) do
     local key = entry.nameLower
-    
+
     local score
     local startPos = key:find(search, 1, true)
     if startPos == 1 then
@@ -503,21 +558,22 @@ local function getSpellSuggestions(prefix)
       local slice = key:sub(1, #search)
       score = 2 + levenshtein(search, slice)
     end
-    
+
     -- Only include reasonable matches
     if score <= 10 then
       local display = entry.name
       if score == 0 then
-        display = '★ ' .. entry.name
+        display = '* ' .. entry.name
       elseif score == 1 then
-        display = '• ' .. entry.name
+        display = '- ' .. entry.name
       end
-      
+
       table.insert(matches, {
         id = entry.id,
         name = entry.name,
         display = display,
-        score = score
+        score = score,
+        minLevel = entry.minLevel
       })
     end
   end
@@ -598,6 +654,14 @@ local function buildAgentCommand(targetName)
   return string.format('/lua run buffme_agent %s', targetName)
 end
 
+
+local function runAgentLocal(targetName)
+  -- Local diagnostic path: runs agent on THIS character only (no broadcast required)
+  -- Useful for testing when E3/EQBC isn't loaded.
+  mq.cmdf('/lua run buffme_agent %s', targetName)
+  state.lastStatus = string.format('Local test: ran agent for %s (no broadcast).', targetName)
+end
+
 local function dispatchToGroup(targetName)
   local anyEnabled = false
   for _,rec in ipairs(settings.buffList) do
@@ -613,7 +677,7 @@ local function dispatchToGroup(targetName)
 
   local ok, modeOrErr = sendToGroup(buildAgentCommand(targetName))
   if not ok then
-    state.lastStatus = 'Dispatch failed: ' .. tostring(modeOrErr)
+    state.lastStatus = 'Dispatch failed: ' .. tostring(modeOrErr) .. ' (Load E3Next plugin or EQBC, or use Local Test.)'
     return
   end
   state.lastStatus = string.format('Dispatched buff request for %s via %s.', targetName, tostring(modeOrErr))
@@ -836,7 +900,7 @@ local function drawUI()
       
       -- Debug output
       ImGui.SameLine()
-      ImGui.TextDisabled(debugMsg)
+      ImGui.TextDisabled(tostring(debugMsg))
 
       ImGui.SameLine()
       if ImGui.Button('Clear##lookup') then
@@ -907,6 +971,40 @@ local function drawUI()
         
         ImGui.Separator()
         ImGui.Text(string.format('Selected: %s [%d]', chosen.name, chosen.id))
+
+        -- Spell details (SpellExport-style)
+        if selectedDetailsID ~= chosen.id then
+          selectedDetailsID = chosen.id
+          selectedDetails = buildSpellDetails(chosen.id)
+        end
+
+        if selectedDetails then
+          ImGui.Separator()
+          ImGui.Text('Details')
+
+          if selectedDetails.desc and selectedDetails.desc ~= '' then
+            ImGui.BeginChild('##spell_desc', 0, 90, true)
+            ImGui.PushTextWrapPos(500)
+            ImGui.TextUnformatted(selectedDetails.desc)
+            ImGui.PopTextWrapPos()
+            ImGui.EndChild()
+          else
+            ImGui.TextDisabled('(No description available)')
+          end
+
+          local line = {}
+          if selectedDetails.mana then table.insert(line, 'Mana: ' .. tostring(selectedDetails.mana)) end
+          if selectedDetails.castTime then table.insert(line, 'Cast: ' .. tostring(selectedDetails.castTime)) end
+          if selectedDetails.recastTime then table.insert(line, 'Recast: ' .. tostring(selectedDetails.recastTime)) end
+          if selectedDetails.duration then table.insert(line, 'Dur: ' .. tostring(selectedDetails.duration)) end
+          if selectedDetails.range then table.insert(line, 'Range: ' .. tostring(selectedDetails.range)) end
+          if selectedDetails.targetType then table.insert(line, 'Target: ' .. tostring(selectedDetails.targetType)) end
+          if #line > 0 then
+            ImGui.TextDisabled(table.concat(line, ' | '))
+          end
+
+        end
+
         
         local canAdd = not buffListHas(chosen.name)
         if not canAdd then
@@ -971,20 +1069,32 @@ local function drawUI()
         state.lastStatus = 'Queue cleared.'
       end
 
-      ImGui.Separator()
-      ImGui.TextUnformatted('Test by name:')
-      local testName = state.testName or ''
-      local newTest = ImGui.InputText('##testname', testName, 64)
-      if type(newTest) == 'string' then
-        state.testName = newTest
-      end
-      ImGui.SameLine()
-      if ImGui.Button('Enqueue Test') then
-        if state.testName and state.testName ~= '' then
-          enqueueRequest(state.testName)
-          state.lastStatus = 'Enqueued test request for ' .. state.testName
-        end
-      end
+ImGui.Separator()
+ImGui.TextUnformatted('Test by name:')
+local testName = state.testName or ''
+local newTest = ImGui.InputText('##testname', testName, 64)
+if type(newTest) == 'string' then
+  state.testName = newTest
+end
+
+-- Show broadcast mode and provide diagnostic local-run option
+local modeName = detectBroadcast()
+ImGui.TextDisabled(string.format('Broadcast mode: %s', modeName))
+
+if ImGui.Button('Enqueue Test (Broadcast)') then
+  if state.testName and state.testName ~= '' then
+    enqueueRequest(state.testName)
+    state.lastStatus = 'Enqueued broadcast request for ' .. state.testName
+  end
+end
+ImGui.SameLine()
+if ImGui.Button('Run Local Test (No Broadcast)') then
+  if state.testName and state.testName ~= '' then
+    runAgentLocal(state.testName)
+  end
+end
+tooltip('Local test runs buffme_agent on THIS character only. Does not require E3/EQBC.')
+
     end
 
     ImGui.Separator()
